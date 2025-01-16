@@ -3,56 +3,56 @@ name: "mysql-encoding-test"
 on:
   push:
     branches: 
-      - main
-      - release-**
-    paths-ignore:
-      - 'docs/**'
-      - '**.md'
-  pull_request:
-    #The branches below must be a subset of the branches above
-    branches: 
-      - main
       - release-**
     paths-ignore:
       - 'docs/**'
       - '**.md'
   workflow_dispatch:
+  schedule:
+    - cron:  '0 17 * * *'
 
 jobs:
   mysql-encoding-test:
-    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    runs-on: ubuntu-20.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           fetch-depth: 1
 
       - name: Set Variable
         id: vars
         run: |
-          echo ::set-output name=META_URL1::"mysql://root:root@\\(127.0.0.1\\)/mysql_encoding1"
-          echo ::set-output name=META_URL2::"mysql://root:root@\\(127.0.0.1\\)/mysql_encoding2"
-          echo ::set-output name=MOUNT_POINT1::/tmp/juicefs-mysql-encoding-test1
-          echo ::set-output name=MOUNT_POINT2::/tmp/juicefs-mysql-encoding-test2
-          echo ::set-output name=BUCKET::/var/jfs/
-          echo ::set-output name=NAME::mysql-encoding-test
+          echo "META_URL1=mysql://root:root@\\(127.0.0.1\\)/mysql_encoding1" >> $GITHUB_OUTPUT
+          echo "META_URL2=mysql://root:root@\\(127.0.0.1\\)/mysql_encoding2" >> $GITHUB_OUTPUT
+          echo "MOUNT_POINT1=/tmp/juicefs-mysql-encoding-test1" >> $GITHUB_OUTPUT
+          echo "MOUNT_POINT2=/tmp/juicefs-mysql-encoding-test2" >> $GITHUB_OUTPUT
+          echo "BUCKET=/var/jfs/" >> $GITHUB_OUTPUT
+          echo "NAME=mysql-encoding-test" >> $GITHUB_OUTPUT
 
-      - name: Build linux target
+      - name: Download old linux target
         run: |
           url=https://github.com/juicedata/juicefs/releases/download/v1.0.0-beta2/juicefs-1.0.0-beta2-linux-amd64.tar.gz
           wget -q $url 
           tar -zxf $(basename $url)
           mv juicefs juicefs_old
-          make juicefs
+
+      - name: Build new linux target
+        timeout-minutes: 10
+        uses: ./.github/actions/build
 
       - name: Init 
         run: |
           sudo /etc/init.d/mysql start
           sudo chmod 777 /var
-          sudo apt install attr
+          sudo .github/scripts/apt_install.sh attr
 
       - name: Test mysql gbk support with new client
         run: |
+          sudo chmod -R 777 /var/log/
+          stat ${{steps.vars.outputs.MOUNT_POINT1}} && [ `stat -c %i ${{steps.vars.outputs.MOUNT_POINT1}}` == 1 ] && ./juicefs umount -f ${{steps.vars.outputs.MOUNT_POINT1}} || echo $?
+          stat ${{steps.vars.outputs.MOUNT_POINT2}} && [ `stat -c %i ${{steps.vars.outputs.MOUNT_POINT2}}` == 1 ] && ./juicefs umount -f ${{steps.vars.outputs.MOUNT_POINT2}} || echo $?
           db_name=$(basename ${{steps.vars.outputs.META_URL1}})
           mysql -uroot -proot -e "drop database if exists $db_name; create database $db_name;" 
           db_name=$(basename ${{steps.vars.outputs.META_URL2}})
@@ -60,24 +60,26 @@ jobs:
           if [ -d ${{ steps.vars.outputs.BUCKET}}/${{ steps.vars.outputs.NAME}} ]; then
             rm ${{ steps.vars.outputs.BUCKET}}/${{ steps.vars.outputs.NAME}} -rf
           fi
-
-          filename="file_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
-          dirname="dir_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
+          
+          filename="file_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
+          dirname="dir_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
           attr_key=user.k
-          attr_value_set="attr_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
-          data_write="data_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
-          soft_link="softlink_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
+          attr_value_set="attr_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
+          data_write="data_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
+          soft_link="softlink_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
 
-          ./juicefs format --bucket ${{ steps.vars.outputs.BUCKET}} ${{steps.vars.outputs.META_URL1}} ${{steps.vars.outputs.NAME}}
-          ./juicefs mount --enable-xattr ${{steps.vars.outputs.META_URL1}}  ${{steps.vars.outputs.MOUNT_POINT1}} -d 
+          ./juicefs format --trash-days 0 --bucket ${{ steps.vars.outputs.BUCKET}} ${{steps.vars.outputs.META_URL1}} ${{steps.vars.outputs.NAME}}
+          ./juicefs mount --no-usage-report --enable-xattr ${{steps.vars.outputs.META_URL1}}  ${{steps.vars.outputs.MOUNT_POINT1}} -d 
           echo $data_write > `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$filename"`
           mkdir `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$dirname"`
           setfattr -n $attr_key -v  $attr_value_set `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$filename"`
           ln -s `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$filename"` `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$soft_link"`
-          ./juicefs dump ${{steps.vars.outputs.META_URL1}}  backup.dump
-
+          ./juicefs dump ${{steps.vars.outputs.META_URL1}}  backup.dump --fast
+          cat backup.dump | grep file_果汁
+          cat backup.dump | grep dir_果汁
+          cat backup.dump | grep softlink_果汁
           ./juicefs load ${{steps.vars.outputs.META_URL2}}  backup.dump
-          ./juicefs mount --enable-xattr ${{steps.vars.outputs.META_URL2}} ${{steps.vars.outputs.MOUNT_POINT2}} -d
+          ./juicefs mount --no-usage-report --enable-xattr ${{steps.vars.outputs.META_URL2}} ${{steps.vars.outputs.MOUNT_POINT2}} -d
 
           if [ ! -f `printf "${{steps.vars.outputs.MOUNT_POINT2}}/$filename"` ]; then 
             echo "Fatal: file does not exist: ", ${{steps.vars.outputs.MOUNT_POINT2}}/$filename
@@ -107,8 +109,13 @@ jobs:
             exit 1
           fi
 
+          ./juicefs umount ${{steps.vars.outputs.MOUNT_POINT1}} || echo $?
+          ./juicefs umount ${{steps.vars.outputs.MOUNT_POINT2}} || echo $?
       - name: Test remount with new client after alter db to binary
         run: |
+          sudo chmod -R 777 /var/log/
+          [ `stat -c %i ${{steps.vars.outputs.MOUNT_POINT1}}` == 1 ] && ./juicefs umount -f ${{steps.vars.outputs.MOUNT_POINT1}} || echo $?
+          [ `stat -c %i ${{steps.vars.outputs.MOUNT_POINT2}}` == 1 ] && ./juicefs umount -f ${{steps.vars.outputs.MOUNT_POINT2}} || echo $?
           db_name=$(basename ${{steps.vars.outputs.META_URL1}})
           mysql -uroot -proot -e "drop database if exists $db_name; create database $db_name;" 
           db_name=$(basename ${{steps.vars.outputs.META_URL2}})
@@ -116,17 +123,17 @@ jobs:
           if [ -d ${{ steps.vars.outputs.BUCKET}}/${{ steps.vars.outputs.NAME}} ]; then
             rm ${{ steps.vars.outputs.BUCKET}}/${{ steps.vars.outputs.NAME}} -rf
           fi
-
-          filename="file_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
-          filename2="file2_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
-          dirname="dir_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
+          
+          filename="file_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
+          filename2="file2_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
+          dirname="dir_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
           attr_key=user.k
-          attr_value_set="attr_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
-          data_write="data_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
-          soft_link="softlink_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
+          attr_value_set="attr_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
+          data_write="data_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
+          soft_link="softlink_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
 
-          ./juicefs_old format --bucket ${{ steps.vars.outputs.BUCKET}} ${{steps.vars.outputs.META_URL1}} ${{steps.vars.outputs.NAME}}
-          ./juicefs_old mount --enable-xattr ${{steps.vars.outputs.META_URL1}}  ${{steps.vars.outputs.MOUNT_POINT1}} -d 
+          ./juicefs_old format --trash-days 0 --bucket ${{ steps.vars.outputs.BUCKET}} ${{steps.vars.outputs.META_URL1}} ${{steps.vars.outputs.NAME}}
+          ./juicefs_old mount --no-usage-report --enable-xattr ${{steps.vars.outputs.META_URL1}}  ${{steps.vars.outputs.MOUNT_POINT1}} -d 
 
           db_name=$(echo "${{steps.vars.outputs.META_URL1}}" | awk -F/ '{print $4}')
           mysql -uroot -proot -e "use $db_name; alter table jfs_edge modify name varbinary(255) not null;" 
@@ -138,7 +145,7 @@ jobs:
           ln -s `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$filename"` `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$soft_link"`
 
           ./juicefs_old umount  ${{steps.vars.outputs.MOUNT_POINT1}} --force
-          ./juicefs mount --enable-xattr ${{steps.vars.outputs.META_URL1}} ${{steps.vars.outputs.MOUNT_POINT1}} -d
+          ./juicefs mount --no-usage-report --enable-xattr ${{steps.vars.outputs.META_URL1}} ${{steps.vars.outputs.MOUNT_POINT1}} -d
           echo $data_write > `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$filename2"`
 
           if [ ! -f `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$filename"` ]; then 
@@ -174,8 +181,12 @@ jobs:
             exit 1
           fi                   
 
+          ./juicefs umount ${{steps.vars.outputs.MOUNT_POINT1}} || echo $?
       - name: Test mount old meta using new client without db change
         run: |
+          sudo chmod -R 777 /var/log/
+          [ `stat -c %i ${{steps.vars.outputs.MOUNT_POINT1}}` == 1 ] && ./juicefs umount -f ${{steps.vars.outputs.MOUNT_POINT1}} || echo $?
+          [ `stat -c %i ${{steps.vars.outputs.MOUNT_POINT2}}` == 1 ] && ./juicefs umount -f ${{steps.vars.outputs.MOUNT_POINT2}} || echo $?
           db_name=$(basename ${{steps.vars.outputs.META_URL1}})
           mysql -uroot -proot -e "drop database if exists $db_name; create database $db_name;" 
           db_name=$(basename ${{steps.vars.outputs.META_URL2}})
@@ -187,8 +198,8 @@ jobs:
           filename="file1"
           data_write="data1"
 
-          ./juicefs_old format --bucket ${{ steps.vars.outputs.BUCKET}} ${{steps.vars.outputs.META_URL1}} ${{steps.vars.outputs.NAME}}
-          ./juicefs mount --enable-xattr ${{steps.vars.outputs.META_URL1}} ${{steps.vars.outputs.MOUNT_POINT1}} -d
+          ./juicefs_old format --trash-days 0 --bucket ${{ steps.vars.outputs.BUCKET}} ${{steps.vars.outputs.META_URL1}} ${{steps.vars.outputs.NAME}}
+          ./juicefs mount --no-usage-report --enable-xattr ${{steps.vars.outputs.META_URL1}} ${{steps.vars.outputs.MOUNT_POINT1}} -d
           echo $data_write > `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$filename"`
 
           if [ ! -f `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$filename"` ]; then 
@@ -202,8 +213,12 @@ jobs:
             exit 1
           fi         
 
+          ./juicefs umount ${{steps.vars.outputs.MOUNT_POINT1}} || echo $?
       - name: Test dump with old client and load with new client
         run: |
+          sudo chmod -R 777 /var/log/
+          [ `stat -c %i ${{steps.vars.outputs.MOUNT_POINT1}}` == 1 ] && ./juicefs umount -f ${{steps.vars.outputs.MOUNT_POINT1}} || echo $?
+          [ `stat -c %i ${{steps.vars.outputs.MOUNT_POINT2}}` == 1 ] && ./juicefs umount -f ${{steps.vars.outputs.MOUNT_POINT2}} || echo $?
           db_name=$(basename ${{steps.vars.outputs.META_URL1}})
           mysql -uroot -proot -e "drop database if exists $db_name; create database $db_name;" 
           db_name=$(basename ${{steps.vars.outputs.META_URL2}})
@@ -211,16 +226,16 @@ jobs:
           if [ -d ${{ steps.vars.outputs.BUCKET}}/${{ steps.vars.outputs.NAME}} ]; then
             rm ${{ steps.vars.outputs.BUCKET}}/${{ steps.vars.outputs.NAME}} -rf
           fi
-
-          filename="file_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
-          dirname="dir_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
+          #果汁（utf8）果汁(gbk)
+          filename="file_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
+          dirname="dir_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
           attr_key=user.k
-          attr_value_set="attr_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
-          data_write="data_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
-          soft_link="softlink_\xb9\xfb\xd6\xad\xca\xfd\xbe\xdd\\\"%%\\\\"
+          attr_value_set="attr_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
+          data_write="data_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
+          soft_link="softlink_\xe6\x9e\x9c\xe6\xb1\x81\xb9\xfb\xd6\xad\\\"%%\\\\"
 
-          ./juicefs_old format --bucket ${{ steps.vars.outputs.BUCKET}} ${{steps.vars.outputs.META_URL1}} ${{steps.vars.outputs.NAME}}
-          ./juicefs_old mount --enable-xattr ${{steps.vars.outputs.META_URL1}}  ${{steps.vars.outputs.MOUNT_POINT1}} -d 
+          ./juicefs_old format --trash-days 0 --bucket ${{ steps.vars.outputs.BUCKET}} ${{steps.vars.outputs.META_URL1}} ${{steps.vars.outputs.NAME}}
+          ./juicefs_old mount --no-usage-report --enable-xattr ${{steps.vars.outputs.META_URL1}}  ${{steps.vars.outputs.MOUNT_POINT1}} -d 
 
           db_name=$(echo "${{steps.vars.outputs.META_URL1}}" | awk -F/ '{print $4}')
           mysql -uroot -proot -e "use $db_name; alter table jfs_edge modify name varbinary(255) not null;" 
@@ -231,9 +246,15 @@ jobs:
           setfattr -n $attr_key -v  $attr_value_set `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$filename"`
           ln -s `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$filename"` `printf "${{steps.vars.outputs.MOUNT_POINT1}}/$soft_link"`
  
-          ./juicefs dump ${{steps.vars.outputs.META_URL1}}  backup.dump
+          ./juicefs_old umount ${{steps.vars.outputs.MOUNT_POINT1}}
+          # upgrade table schema
+          ./juicefs mount --no-usage-report --enable-xattr ${{steps.vars.outputs.META_URL1}}  ${{steps.vars.outputs.MOUNT_POINT1}} -d
+          ./juicefs dump ${{steps.vars.outputs.META_URL1}}  backup.dump --fast
+          cat backup.dump | grep file_果汁
+          cat backup.dump | grep dir_果汁
+          cat backup.dump | grep softlink_果汁
           ./juicefs load ${{steps.vars.outputs.META_URL2}}  backup.dump
-          ./juicefs mount --enable-xattr ${{steps.vars.outputs.META_URL2}} ${{steps.vars.outputs.MOUNT_POINT2}} -d
+          ./juicefs mount --no-usage-report --enable-xattr ${{steps.vars.outputs.META_URL2}} ${{steps.vars.outputs.MOUNT_POINT2}} -d
 
           if [ ! -f `printf "${{steps.vars.outputs.MOUNT_POINT2}}/$filename"` ]; then 
             echo "Fatal: file does not exist: ", ${{steps.vars.outputs.MOUNT_POINT2}}/$filename
@@ -263,13 +284,18 @@ jobs:
             exit 1
           fi          
 
+          ./juicefs umount ${{steps.vars.outputs.MOUNT_POINT1}} || echo $?
+          ./juicefs umount ${{steps.vars.outputs.MOUNT_POINT2}} || echo $?
+          
+      - name: log
+        if: always()
+        run: | 
+          tail -300 ~/.juicefs/juicefs.log
+          grep "<FATAL>:" ~/.juicefs/juicefs.log && exit 1 || true
+
       - name: Send Slack Notification
-        if: ${{ failure() }}
+        if: failure() 
         uses: juicedata/slack-notify-action@main
         with:
           channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_PR_CHECK_NOTIFY }}"
-          slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"  
-
-      - name: Setup upterm session
-        if: ${{ failure() }}
-        uses: lhotari/action-upterm@v1
+          slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"
