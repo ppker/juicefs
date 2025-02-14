@@ -24,6 +24,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -113,67 +114,21 @@ func (tx *etcdTxn) gets(keys ...[]byte) [][]byte {
 	return values
 }
 
-func (tx *etcdTxn) scanRange(begin_, end_ []byte) map[string][]byte {
-	resp, err := tx.kv.Get(tx.ctx, string(begin_), etcd.WithRange(string(end_)))
-	if err != nil {
-		panic(fmt.Errorf("get range [%v-%v): %s", string(begin_), string(end_), err))
+func (tx *etcdTxn) scan(begin, end []byte, keysOnly bool, handler func(k, v []byte) bool) {
+	opts := []etcd.OpOption{etcd.WithRange(string(end))}
+	if keysOnly {
+		opts = append(opts, etcd.WithKeysOnly())
 	}
-	ret := make(map[string][]byte)
-	for _, kv := range resp.Kvs {
-		k := string(kv.Key)
-		tx.observed[k] = kv.ModRevision
-		ret[k] = kv.Value
-	}
-	return ret
-}
-
-func (tx *etcdTxn) scan(prefix []byte, handler func(key []byte, value []byte)) {
-	resp, err := tx.kv.Get(tx.ctx,
-		string(prefix),
-		etcd.WithPrefix(),
-		etcd.WithSerializable())
+	resp, err := tx.kv.Get(tx.ctx, string(begin), opts...)
 	if err != nil {
-		panic(fmt.Errorf("get prefix %v: %s", string(prefix), err))
+		panic(fmt.Errorf("get range [%v-%v): %s", string(begin), string(end), err))
 	}
 	for _, kv := range resp.Kvs {
 		tx.observed[string(kv.Key)] = kv.ModRevision
-		handler(kv.Key, kv.Value)
-	}
-}
-
-func (tx *etcdTxn) scanKeys(prefix []byte) [][]byte {
-	resp, err := tx.kv.Get(tx.ctx, string(prefix), etcd.WithPrefix(), etcd.WithKeysOnly())
-	if err != nil {
-		panic(fmt.Errorf("get prefix %v with keys only: %s", string(prefix), err))
-	}
-	var keys [][]byte
-	for _, kv := range resp.Kvs {
-		tx.observed[string(kv.Key)] = kv.ModRevision
-		keys = append(keys, kv.Key)
-	}
-	return keys
-}
-
-func (tx *etcdTxn) scanValues(prefix []byte, limit int, filter func(k, v []byte) bool) map[string][]byte {
-	if limit == 0 {
-		return nil
-	}
-	resp, err := tx.kv.Get(tx.ctx, string(prefix), etcd.WithPrefix())
-	if err != nil {
-		panic(fmt.Errorf("get prefix %s: %s", string(prefix), err))
-	}
-	ret := make(map[string][]byte)
-	for _, kv := range resp.Kvs {
-		if filter == nil || filter(kv.Key, kv.Value) {
-			k := string(kv.Key)
-			tx.observed[k] = kv.ModRevision
-			ret[k] = kv.Value
-			if limit > 0 && len(ret) >= limit {
-				break
-			}
+		if !handler(kv.Key, kv.Value) {
+			break
 		}
 	}
-	return ret
 }
 
 func (tx *etcdTxn) exist(prefix []byte) bool {
@@ -196,10 +151,9 @@ func (tx *etcdTxn) set(key, value []byte) {
 	}
 }
 
-func (tx *etcdTxn) append(key []byte, value []byte) []byte {
+func (tx *etcdTxn) append(key []byte, value []byte) {
 	new := append(tx.get(key), value...)
 	tx.set(key, new)
-	return new
 }
 
 func (tx *etcdTxn) incrBy(key []byte, value int64) int64 {
@@ -212,10 +166,8 @@ func (tx *etcdTxn) incrBy(key []byte, value int64) int64 {
 	return new
 }
 
-func (tx *etcdTxn) dels(keys ...[]byte) {
-	for _, key := range keys {
-		tx.buffer[string(key)] = nil
-	}
+func (tx *etcdTxn) delete(key []byte) {
+	tx.buffer[string(key)] = nil
 }
 
 func (tx *etcdTxn) commmit() error {
@@ -260,8 +212,11 @@ func (c *etcdClient) shouldRetry(err error) bool {
 	return errors.Is(err, conflicted)
 }
 
-func (c *etcdClient) txn(f func(kvTxn) error) (err error) {
-	ctx := context.Background()
+func (c *etcdClient) config(key string) interface{} {
+	return nil
+}
+
+func (c *etcdClient) txn(ctx context.Context, f func(*kvTxn) error, retry int) (err error) {
 	tx := &etcdTxn{
 		ctx,
 		c.kv,
@@ -278,7 +233,7 @@ func (c *etcdClient) txn(f func(kvTxn) error) (err error) {
 			}
 		}
 	}()
-	err = f(tx)
+	err = f(&kvTxn{tx, retry})
 	if err != nil {
 		return err
 	}
@@ -290,6 +245,40 @@ func (c *etcdClient) txn(f func(kvTxn) error) (err error) {
 
 var conflicted = errors.New("conflicted transaction")
 
+func (c *etcdClient) scan(prefix []byte, handler func(key []byte, value []byte)) error {
+	var start = prefix
+	var end = string(nextKey(prefix))
+	resp, err := c.client.Get(context.Background(), "anything")
+	if err != nil {
+		return err
+	}
+	currentRev := resp.Header.Revision
+	var following bool
+	for {
+		resp, err := c.client.Get(context.Background(),
+			string(start),
+			etcd.WithRange(end),
+			etcd.WithLimit(1024),
+			etcd.WithMaxModRev(currentRev),
+			etcd.WithSerializable())
+		if err != nil {
+			return fmt.Errorf("get start %v: %s", string(start), err)
+		}
+		if following && len(resp.Kvs) > 0 {
+			resp.Kvs = resp.Kvs[1:]
+		}
+		if len(resp.Kvs) == 0 {
+			break
+		}
+		for _, kv := range resp.Kvs {
+			handler(kv.Key, kv.Value)
+		}
+		start = resp.Kvs[len(resp.Kvs)-1].Key
+		following = true
+	}
+	return nil
+}
+
 func (c *etcdClient) reset(prefix []byte) error {
 	_, err := c.kv.Delete(context.Background(), string(prefix), etcd.WithPrefix())
 	return err
@@ -298,6 +287,8 @@ func (c *etcdClient) reset(prefix []byte) error {
 func (c *etcdClient) close() error {
 	return c.client.Close()
 }
+
+func (c *etcdClient) gc() {}
 
 func buildTlsConfig(u *url.URL) (*tls.Config, error) {
 	var tsinfo transport.TLSInfo
@@ -322,8 +313,15 @@ func newEtcdClient(addr string) (tkvClient, error) {
 		return nil, fmt.Errorf("parse %s: %s", addr, err)
 	}
 	passwd, _ := u.User.Password()
+	hosts := strings.Split(u.Host, ",")
+	for i, h := range hosts {
+		h, _, err := net.SplitHostPort(h)
+		if err != nil {
+			hosts[i] = net.JoinHostPort(h, "2379")
+		}
+	}
 	conf := etcd.Config{
-		Endpoints:        strings.Split(u.Host, ","),
+		Endpoints:        hosts,
 		Username:         u.User.Username(),
 		Password:         passwd,
 		AutoSyncInterval: time.Minute,
@@ -336,6 +334,7 @@ func newEtcdClient(addr string) (tkvClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	maxCompactSlices = 100
 	var prefix string = u.Path + "\xFD"
 	return withPrefix(&etcdClient{c, etcd.NewKV(c)}, []byte(prefix)), nil
 }

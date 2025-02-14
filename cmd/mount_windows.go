@@ -14,20 +14,25 @@
  * limitations under the License.
  */
 
-package main
+package cmd
 
 import (
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/juicedata/juicefs/pkg/winfsp"
 	"github.com/urfave/cli/v2"
 )
 
-func mount_flags() []cli.Flag {
+func mountFlags() []cli.Flag {
 	return []cli.Flag{
 		&cli.StringFlag{
 			Name:  "o",
 			Usage: "other FUSE options",
+		},
+		&cli.StringFlag{
+			Name:  "access-log",
+			Usage: "Access log file",
 		},
 		&cli.BoolFlag{
 			Name:  "as-root",
@@ -42,17 +47,38 @@ func mount_flags() []cli.Flag {
 			Name:  "delay-close",
 			Usage: "delay file closing in seconds.",
 		},
+		&cli.BoolFlag{
+			Name:  "d",
+			Aliases: []string{"background"},
+			Usage: "run in background(Windows: as a system service. support ONLY 1 volume mounting at the same time)",
+		},
 	}
 }
 
-func makeDaemon(c *cli.Context, name, mp string, m meta.Meta) error {
+func makeDaemon(c *cli.Context, conf *vfs.Config) error {
+	return winfsp.RunAsSystemSerivce(conf.Format.Name, c.Args().Get(1))
+}
+
+func makeDaemonForSvc(c *cli.Context, m meta.Meta, metaUrl, listenAddr string) error {
 	logger.Warnf("Cannot run in background in Windows.")
 	return nil
 }
 
-func mount_main(v *vfs.VFS, c *cli.Context) {
+func getDaemonStage() int {
+	return 0
+}
+
+func mountMain(v *vfs.VFS, c *cli.Context) {
+	v.Conf.AccessLog = c.String("access-log")
 	winfsp.Serve(v, c.String("o"), c.Float64("file-cache-to"), c.Bool("as-root"), c.Int("delay-close"))
 }
 
-func checkMountpoint(name, mp, logPath string) {
-}
+func checkMountpoint(name, mp, logPath string, background bool) {}
+
+func prepareMp(mp string) {}
+
+func setFuseOption(c *cli.Context, format *meta.Format, vfsConf *vfs.Config) {}
+
+func launchMount(mp string, conf *vfs.Config) error { return nil }
+
+func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorage) {}

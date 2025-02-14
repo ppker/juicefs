@@ -20,6 +20,8 @@
 package meta
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"syscall"
 	"time"
@@ -33,18 +35,19 @@ func (m *dbMeta) Flock(ctx Context, inode Ino, owner_ uint64, ltype uint32, bloc
 		return errno(m.txn(func(s *xorm.Session) error {
 			_, err := s.Delete(&flock{Inode: inode, Owner: owner, Sid: m.sid})
 			return err
-		}))
+		}, inode))
 	}
 	var err syscall.Errno
 	for {
 		err = errno(m.txn(func(s *xorm.Session) error {
-			if exists, err := s.Get(&node{Inode: inode}); err != nil || !exists {
+			if exists, err := s.ForUpdate().Get(&node{Inode: inode}); err != nil || !exists {
 				if err == nil && !exists {
 					err = syscall.ENOENT
 				}
 				return err
 			}
-			rows, err := s.Rows(&flock{Inode: inode})
+			var fs []flock
+			err := s.ForUpdate().Find(&fs, &flock{Inode: inode})
 			if err != nil {
 				return err
 			}
@@ -53,39 +56,39 @@ func (m *dbMeta) Flock(ctx Context, inode Ino, owner_ uint64, ltype uint32, bloc
 				o   int64
 			}
 			var locks = make(map[key]flock)
-			var l flock
-			for rows.Next() {
-				if rows.Scan(&l) == nil {
-					locks[key{l.Sid, l.Owner}] = l
-				}
+			for _, l := range fs {
+				locks[key{l.Sid, l.Owner}] = l
 			}
-			_ = rows.Close()
 
+			me := key{m.sid, owner}
+			flk, ok := locks[me]
+			delete(locks, me)
+			var typec byte = 'W'
 			if ltype == F_RDLCK {
 				for _, l := range locks {
 					if l.Ltype == 'W' {
 						return syscall.EAGAIN
 					}
 				}
-				return mustInsert(s, flock{Inode: inode, Owner: owner, Ltype: 'R', Sid: m.sid})
-			}
-			me := key{m.sid, owner}
-			_, ok := locks[me]
-			delete(locks, me)
-			if len(locks) > 0 {
+				typec = 'R'
+			} else if len(locks) > 0 {
 				return syscall.EAGAIN
 			}
 			var n int64
 			if ok {
-				n, err = s.Cols("Ltype").Update(&flock{Ltype: 'W'}, &flock{Inode: inode, Owner: owner, Sid: m.sid})
+				if flk.Ltype != typec {
+					n, err = s.Cols("Ltype").Update(&flock{Ltype: typec}, &flock{Inode: inode, Owner: owner, Sid: m.sid})
+				} else {
+					n = 1
+				}
 			} else {
-				n, err = s.InsertOne(&flock{Inode: inode, Owner: owner, Ltype: 'W', Sid: m.sid})
+				n, err = s.InsertOne(&flock{Inode: inode, Owner: owner, Ltype: typec, Sid: m.sid})
 			}
 			if err == nil && n == 0 {
 				err = fmt.Errorf("insert/update failed")
 			}
 			return err
-		}))
+		}, inode))
 
 		if !block || err != syscall.EAGAIN {
 			break
@@ -133,12 +136,12 @@ func (m *dbMeta) Getlk(ctx Context, inode Ino, owner_ uint64, ltype *uint32, sta
 		ls := loadLocks(d)
 		for _, l := range ls {
 			// find conflicted locks
-			if (*ltype == F_WRLCK || l.ltype == F_WRLCK) && *end >= l.start && *start <= l.end {
-				*ltype = l.ltype
-				*start = l.start
-				*end = l.end
+			if (*ltype == F_WRLCK || l.Type == F_WRLCK) && *end >= l.Start && *start <= l.End {
+				*ltype = l.Type
+				*start = l.Start
+				*end = l.End
 				if k.sid == m.sid {
-					*pid = l.pid
+					*pid = l.Pid
 				} else {
 					*pid = 0
 				}
@@ -159,7 +162,7 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 	owner := int64(owner_)
 	for {
 		err = errno(m.txn(func(s *xorm.Session) error {
-			if exists, err := s.Get(&node{Inode: inode}); err != nil || !exists {
+			if exists, err := s.ForUpdate().Get(&node{Inode: inode}); err != nil || !exists {
 				if err == nil && !exists {
 					err = syscall.ENOENT
 				}
@@ -167,7 +170,7 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 			}
 			if ltype == F_UNLCK {
 				var l = plock{Inode: inode, Owner: owner, Sid: m.sid}
-				ok, err := m.db.Get(&l)
+				ok, err := s.ForUpdate().Get(&l)
 				if err != nil {
 					return err
 				}
@@ -186,7 +189,8 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 				}
 				return err
 			}
-			rows, err := s.Rows(&plock{Inode: inode})
+			var ps []plock
+			err := s.ForUpdate().Find(&ps, &plock{Inode: inode})
 			if err != nil {
 				return err
 			}
@@ -195,14 +199,9 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 				owner int64
 			}
 			var locks = make(map[key][]byte)
-			var l plock
-			for rows.Next() {
-				l.Records = nil
-				if rows.Scan(&l) == nil {
-					locks[key{l.Sid, l.Owner}] = dup(l.Records)
-				}
+			for _, l := range ps {
+				locks[key{l.Sid, l.Owner}] = l.Records
 			}
-			_ = rows.Close()
 			lkey := key{m.sid, owner}
 			for k, d := range locks {
 				if k == lkey {
@@ -211,24 +210,29 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 				ls := loadLocks(d)
 				for _, l := range ls {
 					// find conflicted locks
-					if (ltype == F_WRLCK || l.ltype == F_WRLCK) && end >= l.start && start <= l.end {
+					if (ltype == F_WRLCK || l.Type == F_WRLCK) && end >= l.Start && start <= l.End {
 						return syscall.EAGAIN
 					}
 				}
 			}
 			ls := updateLocks(loadLocks(locks[lkey]), lock)
 			var n int64
+			records := dumpLocks(ls)
 			if len(locks[lkey]) > 0 {
-				n, err = s.Cols("records").Update(plock{Records: dumpLocks(ls)},
-					&plock{Inode: inode, Sid: m.sid, Owner: owner})
+				if !bytes.Equal(locks[lkey], records) {
+					n, err = s.Cols("records").Update(plock{Records: records},
+						&plock{Inode: inode, Sid: m.sid, Owner: owner})
+				} else {
+					n = 1
+				}
 			} else {
-				n, err = s.InsertOne(&plock{Inode: inode, Sid: m.sid, Owner: owner, Records: dumpLocks(ls)})
+				n, err = s.InsertOne(&plock{Inode: inode, Sid: m.sid, Owner: owner, Records: records})
 			}
 			if err == nil && n == 0 {
 				err = fmt.Errorf("insert/update failed")
 			}
 			return err
-		}))
+		}, inode))
 
 		if !block || err != syscall.EAGAIN {
 			break
@@ -243,4 +247,30 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 		}
 	}
 	return err
+}
+
+func (r *dbMeta) ListLocks(ctx context.Context, inode Ino) ([]PLockItem, []FLockItem, error) {
+	var fs []flock
+	if err := r.db.Find(&fs, &flock{Inode: inode}); err != nil {
+		return nil, nil, err
+	}
+
+	flocks := make([]FLockItem, 0, len(fs))
+	for _, f := range fs {
+		flocks = append(flocks, FLockItem{ownerKey{f.Sid, uint64(f.Owner)}, string(f.Ltype)})
+	}
+
+	var ps []plock
+	if err := r.db.Find(&ps, &plock{Inode: inode}); err != nil {
+		return nil, nil, err
+	}
+
+	plocks := make([]PLockItem, 0)
+	for _, p := range ps {
+		ls := loadLocks(p.Records)
+		for _, l := range ls {
+			plocks = append(plocks, PLockItem{ownerKey{p.Sid, uint64(p.Owner)}, l})
+		}
+	}
+	return plocks, flocks, nil
 }
