@@ -191,6 +191,13 @@ type listThread struct {
 	hasMore   bool
 }
 
+func (l *listThread) reset() {
+	l.err = nil
+	l.entries = nil
+	l.nextToken = ""
+	l.hasMore = false
+}
+
 func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, start, end string, followLink bool) (<-chan Object, error) {
 	entries, _, _, err := store.List(ctx, prefix, start, "", "/", 1e9, followLink)
 	if err != nil {
@@ -219,7 +226,7 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 					if !entries[i].IsDir() || key == prefix {
 						continue
 					}
-					t.entries, t.hasMore, t.nextToken, t.err = store.List(ctx, key, "\x00", t.nextToken, "/", 1e9, followLink) // exclude itself
+					t.entries, t.hasMore, t.nextToken, t.err = store.List(ctx, key, "\x00", t.nextToken, "/", 1000, followLink) // exclude itself
 					t.Lock()
 					t.ready = true
 					t.cond.Signal()
@@ -259,9 +266,21 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 				t.Unlock()
 				return err
 			}
+			for t.hasMore {
+				var more []Object
+				startAfter := t.entries[len(t.entries)-1].Key()
+				more, t.hasMore, t.nextToken, t.err = store.List(ctx, key, startAfter, t.nextToken, "/", 1e9, followLink)
+				if t.err != nil {
+					err = t.err
+					t.Unlock()
+					return err
+				}
+				t.entries = append(t.entries, more...)
+			}
 			t.ready = false
 			t.cond.Signal()
 			children := t.entries
+			t.reset()
 			t.Unlock()
 
 			err = walk(key, children)
